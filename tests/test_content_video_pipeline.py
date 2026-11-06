@@ -109,12 +109,12 @@ def _plan() -> dict:
         "direction": "一镜到底科普：品牌前中后；入出场留在同一场景",
         "core_arc": "异响现象→乱修无效→定位传感器→拔插头验证→结论",
         "character_lock": (
-            "以品牌本人真实样貌为底，做年轻化与轻微美化：脸型更利落、皮肤更干净；"
-            "后脑勺轮廓略更饱满圆润；仍可辨认为本人，半框眼镜可保留。"
+            "以品牌本人真实样貌为底，不改五官。戴素色棒球帽盖住头发。"
+            "半框眼镜可保留。帽上无字无标志。"
             "神态冷静专注，眼神盯住操作对象。"
             "服装留空白贴标面，Kaka Auto Parts 与 MAXCOOL 后期贴上。"
         ),
-        "look_variant": "no_hat",
+        "look_variant": "with_hat",
         "look": "一镜到底感科普，侧逆光，同一场景，竖屏 9:16",
         "branding": "Kaka Auto Parts + MAXCOOL；前中后留空白贴标面，后期贴透明素材",
         "setpiece_open": "同一场景内短步靠近讲解对象，胸前留空白贴标面",
@@ -221,7 +221,8 @@ def test_build_render_prompt_locks_transcript_process_and_details():
     assert scene["structure_focus"] in prompt
     assert "DETAILS THAT MUST SURVIVE" in prompt
     assert "Do NOT invent a different subject" in prompt
-    assert "same face, glasses" in prompt
+    assert "same face" in prompt and "glasses" in prompt
+    assert "baseball cap" in prompt
     assert "No long talking-head" in prompt or "lip-sync" in prompt
     assert "same place, wardrobe and color" in prompt
     assert "finger point, light touch" in prompt or "CLOSE:" in prompt
@@ -275,7 +276,7 @@ def test_video_plan_limits_face_on_host_cuts():
     assert sum("cutaway_host" in s["character_insert"] for s in guarded["scenes"]) == 1
     no_eyes = _plan()
     no_eyes["character_lock"] = (
-        "以品牌本人真实样貌为底，做年轻化美化，穿着 Kaka Auto Parts 与 MAXCOOL 工服。"
+        "以品牌本人真实样貌为底，戴素色棒球帽，穿着 Kaka Auto Parts 与 MAXCOOL 工服。"
     )
     with pytest.raises(PipelineError, match="专注眼神"):
         VideoPlanService.guard_plan(no_eyes)
