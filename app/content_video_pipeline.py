@@ -347,10 +347,11 @@ class VideoPlanService:
             "Educational film, vertical 9:16. One color grade for the whole piece. "
             "Continuous camera move plus motivated shot changes. "
             "The spoken subject and action are the hero.\n"
-            "PERSON RULES: use the approved likeness only. Keep the same face, glasses, "
-            "hair and build. Calm and focused. Do not make the person heavier, balder, "
-            "greasier or menacing. Face only as a brief intercalation; prefer hands "
-            "or over-shoulder on the subject.\n"
+            "PERSON RULES: use the approved likeness only. Keep the same face and glasses. "
+            "Do not change the face. Wear a plain baseball cap that covers the hair. "
+            "No letters or logo on the cap. Calm and focused. Do not make the person "
+            "heavier, balder, greasier or menacing. Face only as a brief intercalation; "
+            "prefer hands or over-shoulder on the subject.\n"
             "BRANDING: composite approved transparent PNG assets later. Generate only "
             "a stable blank patch, never letters, words, captions or logos.\n"
             f"{brand_note}\n"
@@ -606,8 +607,10 @@ class VideoPlanService:
             raise PipelineError("视频计划缺少标题或开头钩子")
         if not title_en or not hook_en:
             raise PipelineError("视频计划缺少海外英文标题或钩子")
-        if "品牌本人" not in character_lock or "年轻化" not in character_lock:
-            raise PipelineError("视频计划必须锁定品牌本人年轻化形象")
+        if "品牌本人" not in character_lock:
+            raise PipelineError("视频计划必须锁定品牌本人")
+        if "棒球帽" not in character_lock and "baseball cap" not in character_lock.lower():
+            raise PipelineError("人物必须戴素色棒球帽盖住头发，不改五官")
         if "眼神" not in character_lock and "专注" not in character_lock:
             raise PipelineError("人物锁定必须要求专注眼神，禁止游离夸张")
         branding = str(raw.get("branding") or "").strip()[:200]
