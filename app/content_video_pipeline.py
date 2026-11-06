@@ -75,7 +75,12 @@ class VideoPlanService:
         "wiring",
         "plug",
         "idle",
+        "subject",
         "结构",
+        "对象",
+        "主体",
+        "位置",
+        "步骤",
         "插头",
         "传感",
         "发动机",
@@ -106,42 +111,25 @@ class VideoPlanService:
         return cleaned[:4]
 
     _BRAND_BEATS = {"open", "mid", "close"}
-    _SETPIECE_HOMAGE_TOKENS = (
-        "致敬",
-        "homage",
-        "经典",
-        "大片",
-        "碟中谍",
-        "mission impossible",
-        "滑索",
-        "杰克逊",
-        "moonwalk",
-        "滑步",
-        "月步",
-        "007",
-        "james bond",
-        "黑客帝国",
-        "matrix",
-        "夺宝奇兵",
-        "indiana",
-        "西部",
-        "枪管",
-        "慢镜",
-        "出画",
-        "入画",
-        "定格",
-        "lockup",
+    _SETPIECE_PLACE_TOKENS = (
+        "同一地点",
+        "同一场景",
+        "同场景",
+        "教学场景",
+        "本片场景",
+        "same place",
     )
-    _SETPIECE_HUMOR_TOKENS = (
-        "冷幽默",
-        "痞笑",
-        "痞帅",
-        "dry humor",
-        "反差",
-        "一本正经",
-        "rogue smirk",
-        "半笑",
-        "嘴角",
+    _MOVIE_SET_TOKENS = (
+        "碟中谍",
+        "杰克逊",
+        "黑客帝国",
+        "夺宝奇兵",
+        "西部片",
+        "mission impossible",
+        "moonwalk",
+        "james bond",
+        "matrix",
+        "indiana",
     )
 
     @staticmethod
@@ -335,33 +323,36 @@ class VideoPlanService:
         setpiece_close = VideoPlanService._render_safe_text(plan.get("setpiece_close"))
         brand_note = {
             "open": (
-                "BRAND OPEN + SETPIECE: distinctive cold-humor film homage entrance "
-                f"({setpiece_open or 'invent a fresh open setpiece'}); "
-                "1–2s then dive into the fault; hold a stable blank chest/hat patch plane "
-                "for approved brand compositing later; generate no letters or logo."
+                "OPEN: one short entrance inside the same place, wardrobe and color "
+                f"as the lesson ({setpiece_open or 'enter the teaching subject'}). "
+                "Then start the first fact. Hold a blank patch for later brand compositing. "
+                "Generate no letters or logo."
             ),
             "mid": (
-                "BRAND MID: during the process, let a stable blank cuff / shoulder / "
-                "hat-side patch plane enter naturally while hands stay the hero."
+                "MID: hands stay on the spoken subject. Vary the gesture across beats: "
+                "finger point, light touch, or the tool already used by this step. "
+                "Do not repeat one identical poke, and do not invent a new procedure. "
+                "A blank patch may pass through; generate no letters or logo."
             ),
             "close": (
-                "BRAND CLOSE + SETPIECE: distinctive cold-humor film homage exit "
-                f"({setpiece_close or 'invent a fresh close setpiece'}); "
-                "after the teaching beat, rogue smirk (痞帅痞笑), stable blank uniform "
-                "lockup plane for approved post-composite branding, clean out."
+                "CLOSE: one short exit in the same place, wardrobe and color "
+                f"({setpiece_close or 'leave the teaching subject'}). "
+                "Calm expression. Blank patch only. Generate no letters or logo."
             ),
         }.get(
             brand_beat,
-            "BRAND: reserve a stable blank uniform patch plane for post-compositing.",
+            "Reserve a stable blank patch for later brand compositing. Generate no text.",
         )
         prompt = (
-            "Educational automotive commercial, vertical 9:16. "
-            "ONE continuous camera move. Structure and process are the hero.\n"
-            "PERSON RULES: real-human demeanor, calm and focused; eyes locked on the part "
-            "(never vacant/wandering); no exaggerated acting; no long talking-head; "
-            "prefer hands / over-shoulder / silhouette; face only as a brief intercalation.\n"
-            "BRANDING: approved brand assets are composited later; generate only stable "
-            "blank patch planes, never letters, words, captions, or logos.\n"
+            "Educational film, vertical 9:16. One color grade for the whole piece. "
+            "Continuous camera move plus motivated shot changes. "
+            "The spoken subject and action are the hero.\n"
+            "PERSON RULES: use the approved likeness only. Keep the same face, glasses, "
+            "hair and build. Calm and focused. Do not make the person heavier, balder, "
+            "greasier or menacing. Face only as a brief intercalation; prefer hands "
+            "or over-shoulder on the subject.\n"
+            "BRANDING: composite approved transparent PNG assets later. Generate only "
+            "a stable blank patch, never letters, words, captions or logos.\n"
             f"{brand_note}\n"
             f"TRANSCRIPT ANCHOR (must teach this): {scene.get('transcript_anchor')}\n"
             f"CORE CLAIM: {scene.get('core_claim')}\n"
@@ -371,8 +362,8 @@ class VideoPlanService:
             f"CHARACTER INSERT: {scene.get('character_insert')}\n"
             "DETAILS THAT MUST SURVIVE slow-motion scrutiny:\n"
             f"{detail_lines}\n"
-            "Do NOT invent a different fault, part, or repair path. "
-            "No generic garage B-roll that cannot prove the process step. "
+            "Do NOT invent a different subject, step, or outcome. "
+            "No unrelated B-roll that cannot prove the process step. "
             "Do NOT fill the shot with lip-sync talking face. "
             "NO on-screen text, NO captions, NO subtitles, NO generated words or logos. "
             "Brand marks are composited later from approved assets. "
@@ -493,17 +484,16 @@ class VideoPlanService:
                 raise PipelineError(
                     f"第 {index} 个场景（{brand_beat}）画面需写出品牌落点，不能空镜"
                 )
-            if brand_beat in {"open", "close"} and not (
-                VideoPlanService._has_any_token(
-                    brand_blob, VideoPlanService._SETPIECE_HOMAGE_TOKENS
-                )
-                and VideoPlanService._has_any_token(
-                    brand_blob, VideoPlanService._SETPIECE_HUMOR_TOKENS
-                )
+            if brand_beat in {"open", "close"} and not VideoPlanService._has_any_token(
+                brand_blob, VideoPlanService._SETPIECE_PLACE_TOKENS
             ):
                 raise PipelineError(
-                    f"第 {index} 个场景（{brand_beat}）须含冷幽默 + 经典大片致敬入/出场"
+                    f"第 {index} 个场景（{brand_beat}）入场或出场必须留在同一场景"
                 )
+            if VideoPlanService._has_any_token(
+                brand_blob, VideoPlanService._MOVIE_SET_TOKENS
+            ):
+                raise PipelineError(f"第 {index} 个场景不能换成电影布景")
             matched = next(
                 (
                     mode
@@ -519,7 +509,7 @@ class VideoPlanService:
                 )
             blob = f"{visual_prompt}\n{structure_focus}\n{process_step}".lower()
             if not any(token in blob for token in VideoPlanService._STRUCTURE_TOKENS):
-                raise PipelineError(f"第 {index} 个场景必须以汽车结构与操作为主体")
+                raise PipelineError(f"第 {index} 个场景必须以口播对象与操作为主体")
             # 流程词只看 process_step，避免 visual 里残留动词掩盖空步骤
             if not any(
                 token in process_step
@@ -637,15 +627,12 @@ class VideoPlanService:
         if setpiece_open == setpiece_close:
             raise PipelineError("入场与出场 setpiece 不能雷同")
         for label, piece in (("入场", setpiece_open), ("出场", setpiece_close)):
-            if not (
-                VideoPlanService._has_any_token(
-                    piece, VideoPlanService._SETPIECE_HOMAGE_TOKENS
-                )
-                and VideoPlanService._has_any_token(
-                    piece, VideoPlanService._SETPIECE_HUMOR_TOKENS
-                )
+            if not VideoPlanService._has_any_token(
+                piece, VideoPlanService._SETPIECE_PLACE_TOKENS
             ):
-                raise PipelineError(f"{label} setpiece 须含冷幽默与经典大片致敬")
+                raise PipelineError(f"{label}必须留在教学的同一场景")
+            if VideoPlanService._has_any_token(piece, VideoPlanService._MOVIE_SET_TOKENS):
+                raise PipelineError(f"{label}不能换成电影布景")
         if look_variant not in {"no_hat", "with_hat"}:
             raise PipelineError("造型只允许 no_hat 或 with_hat")
         look_blob = f"{direction}\n{look}"
@@ -660,14 +647,14 @@ class VideoPlanService:
             "hook_en": hook_en,
             "rights_mode": "regenerate",
             "direction": direction
-            or "一镜到底商业广告科普：还原口播；品牌前中后；入出场冷幽默大片致敬",
+            or "一镜到底科普：还原口播；品牌前中后；入出场留在同一场景",
             "core_arc": core_arc,
             "character_lock": character_lock,
             "look_variant": look_variant,
             "look": look
-            or "一镜到底感商业广告汽修科普，侧逆光；入出场特色 setpiece，竖屏 9:16",
+            or "一镜到底感科普，侧逆光，同一场景，竖屏 9:16",
             "branding": branding
-            or "Kaka Auto Parts + MAXCOOL；前开场露出、中段操作穿插、末段 lockup + 痞帅痞笑",
+            or "Kaka Auto Parts + MAXCOOL；前中后留空白贴标面，后期贴透明素材",
             "setpiece_open": setpiece_open,
             "setpiece_close": setpiece_close,
             **copy_package,

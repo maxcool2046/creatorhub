@@ -28,7 +28,7 @@ def _plan() -> dict:
             "发动机怠速剧烈抖动",
             "hand_insert 指向抖动区域",
             "open",
-            "杰克逊滑步致敬冷幽默入画，棒球帽檐 MAXCOOL 一闪，胸标 Kaka Auto Parts 可读",
+            "同一场景内走近讲解对象，胸标留空白贴标面",
         ),
         (
             "对比已换火花塞仍抖动",
@@ -49,7 +49,7 @@ def _plan() -> dict:
             "拔掉传感器插头后怠速变稳",
             "hand_insert 完成拔插",
             "close",
-            "碟中谍滑索致敬冷幽默出画，痞帅痞笑被向上一点点拉出画外，胸前品牌 lockup",
+            "同一场景内结论后离开，工服留空白贴标面",
         ),
     ]
     scenes = []
@@ -106,19 +106,19 @@ def _plan() -> dict:
         "hook": "怠速抖得像拖拉机，先别急着大修。",
         "hook_en": "Idle shakes hard — don't rebuild yet. Watch this connector.",
         "rights_mode": "regenerate",
-        "direction": "一镜到底商业广告科普：品牌前中后；入出场冷幽默大片致敬",
+        "direction": "一镜到底科普：品牌前中后；入出场留在同一场景",
         "core_arc": "异响现象→乱修无效→定位传感器→拔插头验证→结论",
         "character_lock": (
             "以品牌本人真实样貌为底，做年轻化与轻微美化：脸型更利落、皮肤更干净；"
             "后脑勺轮廓略更饱满圆润；仍可辨认为本人，半框眼镜可保留。"
-            "神态冷静专注，眼神盯零件不游离；出场可痞帅痞笑；"
-            "穿着带 Kaka Auto Parts 与 MAXCOOL 标识的专业汽修工服。"
+            "神态冷静专注，眼神盯住操作对象。"
+            "服装留空白贴标面，Kaka Auto Parts 与 MAXCOOL 后期贴上。"
         ),
         "look_variant": "no_hat",
-        "look": "一镜到底感商业广告汽修科普，侧逆光；入出场特色 setpiece，竖屏 9:16",
-        "branding": "Kaka Auto Parts + MAXCOOL；前开场露出、中段操作穿插、末段 lockup + 痞帅痞笑",
-        "setpiece_open": "致敬杰克逊滑步冷幽默入场：棒球帽檐 MAXCOOL 一闪再蹲进机舱",
-        "setpiece_close": "致敬碟中谍滑索冷幽默出场：痞帅痞笑被向上一点点拉出画外 + lockup",
+        "look": "一镜到底感科普，侧逆光，同一场景，竖屏 9:16",
+        "branding": "Kaka Auto Parts + MAXCOOL；前中后留空白贴标面，后期贴透明素材",
+        "setpiece_open": "同一场景内短步靠近讲解对象，胸前留空白贴标面",
+        "setpiece_close": "同一场景内结论后离开，服装留空白贴标面",
         "source_beats": source_beats,
         "copy_cn": " ".join(item["copy_cn_sentence"] for item in coverage_check),
         "copy_en": " ".join(item["copy_en_sentence"] for item in coverage_check),
@@ -220,20 +220,19 @@ def test_build_render_prompt_locks_transcript_process_and_details():
     assert scene["process_step"] in prompt
     assert scene["structure_focus"] in prompt
     assert "DETAILS THAT MUST SURVIVE" in prompt
-    assert "Do NOT invent a different fault" in prompt
-    assert "never vacant/wandering" in prompt
+    assert "Do NOT invent a different subject" in prompt
+    assert "same face, glasses" in prompt
     assert "No long talking-head" in prompt or "lip-sync" in prompt
-    assert "BRAND CLOSE" in prompt
-    assert "SETPIECE" in prompt
-    assert "rogue smirk" in prompt or "痞帅痞笑" in prompt
-    assert "composited later" in prompt
+    assert "same place, wardrobe and color" in prompt
+    assert "finger point, light touch" in prompt or "CLOSE:" in prompt
+    assert "composited later" in prompt or "composite approved" in prompt
     assert "NO on-screen text" in prompt
     assert "Kaka Auto Parts" not in prompt and "MAXCOOL" not in prompt
-    assert "碟中谍" in prompt or "滑索" in prompt
+    assert "同一场景" in prompt
 
 
 def test_video_plan_requires_brand_beats_open_mid_close():
-    """品牌植入必须前中后都有，入出场要有冷幽默大片致敬。"""
+    """品牌植入必须前中后都有，入出场留在同一场景。"""
     plan = _plan()
     guarded = VideoPlanService.guard_plan(plan)
     beats = {scene["brand_beat"] for scene in guarded["scenes"]}
@@ -251,8 +250,12 @@ def test_video_plan_requires_brand_beats_open_mid_close():
     weak_close["scenes"][3]["visual_prompt"] = (
         "连续竖屏：拔插头验证怠速，胸前 Kaka Auto Parts 标识可读，挥手硬广推销结束"
     )
-    with pytest.raises(PipelineError, match="冷幽默|大片致敬"):
+    with pytest.raises(PipelineError, match="同一场景"):
         VideoPlanService.guard_plan(weak_close)
+    movie_set = _plan()
+    movie_set["setpiece_open"] = "碟中谍滑索入场，离开教学场景"
+    with pytest.raises(PipelineError, match="电影布景"):
+        VideoPlanService.guard_plan(movie_set)
     same_setpiece = _plan()
     same_setpiece["setpiece_close"] = same_setpiece["setpiece_open"]
     with pytest.raises(PipelineError, match="不能雷同"):
