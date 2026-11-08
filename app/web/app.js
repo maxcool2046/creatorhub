@@ -8513,14 +8513,29 @@ function openTaskQueueSource(tab) {
 
 let CONTENT_INDEX_ITEMS = [];
 let CONTENT_VIDEO_REFRESH_TIMER = null;
+let CONTENT_PREMIUM_ENABLE = false;
+let CONTENT_PREMIUM_EDITING_ID = "";
+let CONTENT_PREMIUM_DRAFT_TIMER = null;
+let CONTENT_PREMIUM_DIRTY = false;
 
 async function refreshContentIndex() {
   const list = $("ci-list");
   if (!list) return;
+  if (CONTENT_PREMIUM_EDITING_ID && CONTENT_PREMIUM_DIRTY) {
+    try {
+      const data = await api("/api/content-index");
+      CONTENT_INDEX_ITEMS = data.items || [];
+      CONTENT_PREMIUM_ENABLE = !!data.premium_enable;
+    } catch (e) {
+      toast("刷新失败：" + e.message, "err");
+    }
+    return;
+  }
   list.innerHTML = skeleton(4);
   try {
     const data = await api("/api/content-index");
     CONTENT_INDEX_ITEMS = data.items || [];
+    CONTENT_PREMIUM_ENABLE = !!data.premium_enable;
     renderContentIndex();
   } catch (e) {
     list.innerHTML = empty(4, "成品索引暂时无法读取", "i-info", e.message || "请稍后重试");
@@ -8569,11 +8584,19 @@ function renderContentIndex() {
       ? `${metadata.year_start}-${metadata.year_end}` : metadata.year_start].filter(Boolean).join(" · ") || "车型未从口播确认";
     const videoStatus = item.video_status || "";
     const videoPlan = item.video_plan || null;
+    const taskMode = item.task_mode || "batch";
+    const premiumStatus = item.premium_status || "";
     const contentStatus = item.status === "drafted" && videoPlan
       ? "文案与分镜已生成"
       : (labels[item.status] || item.status);
     const safeId = esc(item.source_id);
     let videoAction = `<div class="alert">先点上方“生成文案与分镜”，系统才会准备视频脚本。</div>`;
+    if (taskMode === "premium" && ["editing", ""].includes(premiumStatus || "editing") && !videoPlan) {
+      videoAction = `<div class="form-actions">
+        <button onclick="openPremiumEditor('${safeId}', this)"><svg><use href="#i-list"/></svg>进入编排编辑器</button>
+        <button class="ghost" onclick="startPremiumBlank('${safeId}', this)">空白账本</button>
+      </div>`;
+    }
     if (videoPlan && ["planned", "failed"].includes(videoStatus)) {
       videoAction = `<div class="form-actions">
         <label class="field" for="ci-quality-${safeId}">视频质量</label>
@@ -8584,7 +8607,11 @@ function renderContentIndex() {
         <button id="ci-video-btn-${safeId}" onclick="startContentVideo('${safeId}', this)">
           <svg><use href="#i-film"/></svg>查看精确费用并制作
         </button>
+        ${taskMode === "premium" && premiumStatus !== "ready" ? `<button class="ghost" onclick="openPremiumEditor('${safeId}', this)">打开编排编辑器</button>` : ""}
       </div>`;
+    }
+    if (taskMode === "premium" && premiumStatus === "ready" && videoStatus === "planned") {
+      videoAction = `<div class="hint" role="status">编排完成待报价</div>` + videoAction;
     }
     if (["queued", "generating", "rendering"].includes(videoStatus)) {
       videoAction = `<div class="hint"><b>${esc(videoLabels[videoStatus])}</b>
@@ -8596,22 +8623,30 @@ function renderContentIndex() {
          <p><a class="btn ghost" href="/api/content-index/video/${safeId}/file" download>下载 AI 成片</a></p>`
       : "";
     const videoError = item.video_error
-      ? `<div class="alert err">${esc(item.video_error)}</div>` : "";
-    return `<article class="card compact-card">
+      ? `<div class="alert err" role="alert">${esc(item.video_error)}</div>` : "";
+    const modeSwitch = CONTENT_PREMIUM_ENABLE ? `<div class="form-actions" style="gap:12px;flex-wrap:wrap">
+        <label style="cursor:pointer"><input type="radio" name="ci-mode-${safeId}" data-task-mode="batch" ${taskMode !== "premium" ? "checked" : ""} onchange="changeContentTaskMode('${safeId}', 'batch')"> 批量自动模式</label>
+        <label style="cursor:pointer"><input type="radio" name="ci-mode-${safeId}" data-task-mode="premium" ${taskMode === "premium" ? "checked" : ""} onchange="changeContentTaskMode('${safeId}', 'premium')"> 精品人工编排模式</label>
+      </div>` : `<div class="mut">任务模式：批量</div>`;
+    const editorOpen = CONTENT_PREMIUM_EDITING_ID === item.source_id;
+    const editorPanel = editorOpen ? renderPremiumEditor(item) : "";
+    return `<article class="card compact-card" data-source-id="${safeId}">
       <div class="card-head"><span class="card-ic"><svg><use href="#i-film"/></svg></span>
         <h3>${esc(title)} <span class="sub">${esc(contentStatus)}</span></h3>
       </div>
+      ${modeSwitch}
       <p><b>原始标题：</b>${esc(item.source_title)}<br><b>来源作者：</b>${esc(item.author)}
-        · <b>编号：</b>${esc(item.source_id)}</p>
+        · <b>编号：</b>${esc(item.source_id)} · <b>模式：</b>${taskMode === "premium" ? "精品" : "批量"}</p>
       <p class="mut"><b>车型：</b>${esc(vehicle)} · <b>主题：</b>${esc(metadata.topic || "待识别")}
         · <b>草稿：</b>${Number(item.draft_count || 0)} / 9</p>
-      ${item.error ? `<div class="alert err">${esc(item.error)}</div>` : ""}
-      <div class="hint"><b>视频阶段：</b>${esc(videoLabels[videoStatus] || "尚未生成视频分镜")}
+      ${item.error ? `<div class="alert err" role="alert">${esc(item.error)}</div>` : ""}
+      <div class="hint"><b>视频阶段：</b>${esc(videoLabels[videoStatus] || (taskMode === "premium" ? "待编排" : "尚未生成视频分镜"))}
         ${videoPlan ? ` · 全新画面 ${videoPlan.scenes?.length || 0} 段 · ${videoPlan.duration_seconds || 20} 秒` : ""}
       </div>
       ${videoError}
       ${videoAction}
       ${videoResult}
+      ${editorPanel}
       <details><summary>查看 AI 摘要与处理依据</summary>
         <div class="hint">${esc(metadata.summary || "尚未处理")}<br>
         <b>依据范围：</b>仅口播文字；参考原片不会上传给视频模型。</div>
@@ -8619,9 +8654,215 @@ function renderContentIndex() {
     </article>`;
   }).join("");
   clearTimeout(CONTENT_VIDEO_REFRESH_TIMER);
-  if (CONTENT_INDEX_ITEMS.some(item => ["queued", "generating", "rendering"].includes(item.video_status))) {
+  if (!CONTENT_PREMIUM_EDITING_ID && CONTENT_INDEX_ITEMS.some(item => ["queued", "generating", "rendering"].includes(item.video_status))) {
     CONTENT_VIDEO_REFRESH_TIMER = setTimeout(refreshContentIndex, 5000);
   }
+}
+
+function premiumCoverage(item) {
+  const script = item.premium_script || {};
+  const plan = script.video_plan || item.video_plan || {};
+  const beats = (script.fact_ledger || plan.source_beats || []).map(b => b.beat_id).filter(Boolean);
+  const covered = new Set();
+  for (const scene of plan.scenes || []) {
+    for (const id of scene.beat_ids || []) covered.add(String(id));
+  }
+  const total = beats.length || 0;
+  const done = beats.filter(id => covered.has(String(id))).length;
+  return { total, done, beats, covered };
+}
+
+function renderPremiumEditor(item) {
+  const safeId = esc(item.source_id);
+  const script = item.premium_script || {};
+  const plan = script.video_plan || {};
+  const ledger = script.fact_ledger || plan.source_beats || [];
+  const scenes = plan.scenes || [];
+  const cov = premiumCoverage(item);
+  const revisions = item.premium_revisions || [];
+  const readonly = item.premium_status === "ready" && ["queued", "generating", "rendering", "ready"].includes(item.video_status || "");
+  return `<div class="stack" id="premium-editor-${safeId}" style="margin-top:12px;border-top:1px solid var(--line,#e2e8f0);padding-top:12px">
+    <div class="hint" data-coverage="${cov.done}/${cov.total}"><b>知识点覆盖：</b>${cov.done} / ${cov.total}</div>
+    <div class="hint"><b>规则参考：</b>全片最多一段正脸；单段时长 4–15 秒；同车间同色调；禁止电影布景与乱写 logo。</div>
+    <div style="display:grid;grid-template-columns:minmax(220px,1fr) minmax(280px,1.4fr);gap:12px">
+      <div>
+        <h4>事实账本</h4>
+        ${ledger.length ? ledger.map((row, idx) => `
+          <button type="button" class="ghost sm" style="display:block;width:100%;text-align:left;margin:4px 0;min-height:44px"
+            onclick="highlightPremiumBeats('${safeId}', '${esc(row.beat_id || "")}')">
+            ${esc(row.beat_id || ("#" + (idx + 1)))} · ${esc(row.corrected_fact || row.source_quote || "")}
+          </button>`).join("") : `<div class="mut">暂无账本，可点空白账本或重新生成。</div>`}
+      </div>
+      <div>
+        <h4>分镜时间轴</h4>
+        ${scenes.length ? scenes.map((scene, idx) => `
+          <div class="card" data-premium-scene="${idx}" data-beat-ids="${esc((scene.beat_ids || []).join(","))}" style="margin:6px 0;padding:10px">
+            <b>第 ${idx + 1} 段</b> · ${esc(scene.character_insert || "")} · ${Number(scene.duration || 0)}s
+            <div class="mut">${esc(scene.process_step || scene.beat || "")}</div>
+            <div class="mut">运镜：${esc(scene.camera_move || "")}</div>
+          </div>`).join("") : `<div class="mut">暂无分镜。</div>`}
+      </div>
+    </div>
+    <div class="form-actions">
+      <button ${readonly ? "disabled" : ""} onclick="savePremiumDraft('${safeId}', false, this)">保存编排</button>
+      <button class="ghost" ${readonly ? "disabled" : ""} onclick="savePremiumDraft('${safeId}', true, this)">保存草稿</button>
+      <button ${readonly ? "disabled" : ""} onclick="submitPremiumEditor('${safeId}', this)">提交编排</button>
+      <button class="ghost" onclick="closePremiumEditor()">关闭编辑器</button>
+    </div>
+    <div>
+      <h4>版本</h4>
+      ${revisions.length ? revisions.map(rev => `
+        <button type="button" class="ghost sm" style="min-height:44px;margin:4px 4px 0 0"
+          onclick="restorePremiumRevision('${safeId}', ${Number(rev.id)}, this)">恢复此版本 #${esc(String(rev.id))}</button>
+      `).join("") : `<div class="mut">尚无人工保存版本</div>`}
+    </div>
+    <input type="hidden" id="premium-draft-version-${safeId}" value="${Number(script.draft_version || 1)}">
+  </div>`;
+}
+
+async function changeContentTaskMode(sourceId, mode) {
+  const item = CONTENT_INDEX_ITEMS.find(row => row.source_id === sourceId);
+  const current = item?.task_mode || "batch";
+  if (current === mode) return;
+  if (current === "premium" && mode === "batch" && (item?.premium_script || CONTENT_PREMIUM_DIRTY)) {
+    const ok = window.confirm("切换到批量模式，当前编排内容会清空，是否继续？");
+    if (!ok) {
+      renderContentIndex();
+      return;
+    }
+  }
+  try {
+    await api(`/api/content-index/video/${encodeURIComponent(sourceId)}/mode`, {
+      method: "POST",
+      body: JSON.stringify({ task_mode: mode }),
+    });
+    if (mode === "premium") CONTENT_PREMIUM_EDITING_ID = sourceId;
+    else if (CONTENT_PREMIUM_EDITING_ID === sourceId) closePremiumEditor();
+    CONTENT_PREMIUM_DIRTY = false;
+    await refreshContentIndex();
+  } catch (e) {
+    toast("切换模式失败：" + e.message, "err");
+    await refreshContentIndex();
+  }
+}
+
+async function openPremiumEditor(sourceId, button) {
+  await withBusy(button || evtBtn(), "打开编排…", async () => {
+    try {
+      const item = CONTENT_INDEX_ITEMS.find(row => row.source_id === sourceId);
+      if (!item?.premium_script) {
+        await api(`/api/content-index/video/${encodeURIComponent(sourceId)}/premium/start`, {
+          method: "POST",
+          body: JSON.stringify({}),
+        });
+      }
+      CONTENT_PREMIUM_EDITING_ID = sourceId;
+      CONTENT_PREMIUM_DIRTY = false;
+      clearInterval(CONTENT_PREMIUM_DRAFT_TIMER);
+      CONTENT_PREMIUM_DRAFT_TIMER = setInterval(() => savePremiumDraft(sourceId, true), 30000);
+      await refreshContentIndex();
+      renderContentIndex();
+    } catch (e) {
+      toast("打开编排失败：" + e.message, "err");
+    }
+  });
+}
+
+async function startPremiumBlank(sourceId, button) {
+  await withBusy(button || evtBtn(), "创建空白账本…", async () => {
+    await api(`/api/content-index/video/${encodeURIComponent(sourceId)}/premium/start`, {
+      method: "POST",
+      body: JSON.stringify({ blank: true }),
+    });
+    CONTENT_PREMIUM_EDITING_ID = sourceId;
+    await refreshContentIndex();
+    renderContentIndex();
+  });
+}
+
+function closePremiumEditor() {
+  CONTENT_PREMIUM_EDITING_ID = "";
+  CONTENT_PREMIUM_DIRTY = false;
+  clearInterval(CONTENT_PREMIUM_DRAFT_TIMER);
+  CONTENT_PREMIUM_DRAFT_TIMER = null;
+  renderContentIndex();
+}
+
+function highlightPremiumBeats(sourceId, beatId) {
+  const root = $(`premium-editor-${sourceId}`);
+  if (!root) return;
+  root.querySelectorAll("[data-premium-scene]").forEach(node => {
+    const ids = (node.getAttribute("data-beat-ids") || "").split(",");
+    node.style.outline = ids.includes(beatId) ? "2px solid #2563eb" : "";
+  });
+}
+
+async function savePremiumDraft(sourceId, draft = true, button) {
+  const item = CONTENT_INDEX_ITEMS.find(row => row.source_id === sourceId);
+  if (!item) return;
+  const script = item.premium_script || {};
+  const version = Number($(`premium-draft-version-${sourceId}`)?.value || script.draft_version || 1);
+  const run = async () => {
+    const result = await api(`/api/content-index/video/${encodeURIComponent(sourceId)}/premium/save${draft ? "?draft=1" : ""}`, {
+      method: "POST",
+      body: JSON.stringify({
+        draft: !!draft,
+        fact_ledger: script.fact_ledger || [],
+        video_plan: script.video_plan || {},
+        audio_mode: script.audio_mode || "dub_after",
+        ending_mode: script.ending_mode || "normal",
+        expected_version: version,
+      }),
+    });
+    CONTENT_PREMIUM_DIRTY = false;
+    if ($(`premium-draft-version-${sourceId}`)) {
+      $(`premium-draft-version-${sourceId}`).value = String(result.draft_version || version);
+    }
+    if (!draft) toast("已保存编排版本", "ok");
+    const data = await api("/api/content-index");
+    CONTENT_INDEX_ITEMS = data.items || [];
+  };
+  if (button) await withBusy(button, draft ? "自动保存…" : "保存中…", run);
+  else {
+    try { await run(); } catch (e) { /* 自动草稿失败不打断 */ }
+  }
+}
+
+async function submitPremiumEditor(sourceId, button) {
+  const item = CONTENT_INDEX_ITEMS.find(row => row.source_id === sourceId);
+  if (!item) return;
+  const script = item.premium_script || {};
+  await withBusy(button || evtBtn(), "提交编排…", async () => {
+    try {
+      await api(`/api/content-index/video/${encodeURIComponent(sourceId)}/premium/submit`, {
+        method: "POST",
+        body: JSON.stringify({
+          fact_ledger: script.fact_ledger || [],
+          plan: script.video_plan || {},
+          audio_mode: script.audio_mode || "dub_after",
+          ending_mode: script.ending_mode || "normal",
+        }),
+      });
+      toast("编排已提交，可确认费用制作", "ok");
+      closePremiumEditor();
+      await refreshContentIndex();
+    } catch (e) {
+      toast("提交失败：" + e.message, "err");
+    }
+  });
+}
+
+async function restorePremiumRevision(sourceId, revisionId, button) {
+  await withBusy(button || evtBtn(), "恢复版本…", async () => {
+    await api(`/api/content-index/video/${encodeURIComponent(sourceId)}/premium/revisions/${revisionId}/restore`, {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+    toast("已恢复此版本", "ok");
+    CONTENT_PREMIUM_EDITING_ID = sourceId;
+    await refreshContentIndex();
+    renderContentIndex();
+  });
 }
 
 async function scanContentIndex(button) {

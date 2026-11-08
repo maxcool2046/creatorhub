@@ -141,6 +141,12 @@ risk_control:
 storage:
   db_path: ./data/creatorhub.db
 
+# 成品索引精品编排（默认关闭；需 load_config 读取才会生效）
+premium_enable: false
+premium_max_inflight: 1
+premium_dub_sync_enable: false
+premium_ending_enable: false
+
 # 代理池:建号时一号一代理 sticky 分配(占用最少优先)。务必用住宅/4G 长效代理,
 # 一号一长效固定 IP,IP 地区与账号时区/locale 一致;切勿机房 IP、切勿多号共享一个 IP。
 # 支持 http / https / socks5,可带账号密码。留空则不分配(走宿主真实 IP,多账号有关联风险)。

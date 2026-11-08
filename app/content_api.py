@@ -72,12 +72,62 @@ def content_store() -> ContentIndexStore:
     return ContentIndexStore(content_paths()[2])
 
 
+def premium_flags() -> dict:
+    """读取配置中的精品开关；缺省全部关闭。"""
+    try:
+        from .config import load_config
+
+        runtime_config = load_config()
+    except Exception:
+        return {
+            "premium_enable": False,
+            "premium_max_inflight": 1,
+            "premium_dub_sync_enable": False,
+            "premium_ending_enable": False,
+        }
+    return {
+        "premium_enable": bool(getattr(runtime_config, "premium_enable", False)),
+        "premium_max_inflight": max(
+            1, int(getattr(runtime_config, "premium_max_inflight", 1) or 1)
+        ),
+        "premium_dub_sync_enable": bool(
+            getattr(runtime_config, "premium_dub_sync_enable", False)
+        ),
+        "premium_ending_enable": bool(
+            getattr(runtime_config, "premium_ending_enable", False)
+        ),
+    }
+
+
+def _coerce_audio_ending(body: dict, flags: dict) -> tuple[str, str]:
+    """未放行的精品音视频标记降级为安全默认值。"""
+    audio = str(body.get("audio_mode") or "dub_after").strip()
+    ending = str(body.get("ending_mode") or "normal").strip()
+    if audio == "sync_speech" and not flags.get("premium_dub_sync_enable"):
+        audio = "dub_after"
+    if audio not in {"dub_after", "sync_speech"}:
+        audio = "dub_after"
+    if ending == "black_fixed_text" and not flags.get("premium_ending_enable"):
+        ending = "normal"
+    if ending not in {"normal", "black_fixed_text"}:
+        ending = "normal"
+    return audio, ending
+
+
+def _require_premium_enabled():
+    """精品总开关关闭时返回 404 响应。"""
+    if not premium_flags().get("premium_enable"):
+        return JSONResponse({"detail": "精品模式未开放"}, status_code=404)
+    return None
+
+
 @router.get("")
 async def list_content_index():
     """列出本机素材状态和 AI 草稿数量。"""
     store = content_store()
     items = store.list_assets()
-    return {"count": len(items), "items": items}
+    flags = premium_flags()
+    return {"count": len(items), "items": items, **flags}
 
 
 @router.post("/scan")
@@ -521,8 +571,10 @@ async def quote_content_video(source_id: str, body: dict):
     if quality not in {"preview", "quality"}:
         return JSONResponse({"detail": "未知视频质量档位"}, status_code=400)
     job = content_store().get_video_job(source_id)
-    if not job:
+    if not job or not (job.get("plan") or {}).get("scenes"):
         return JSONResponse({"detail": "视频计划不存在"}, status_code=404)
+    if job.get("plan_model") == "premium-draft":
+        return JSONResponse({"detail": "精品编排尚未提交"}, status_code=400)
     client = _ads_media_client()
     scene_durations = [
         int(scene.get("duration") or 0)
@@ -557,11 +609,13 @@ async def generate_content_video(source_id: str, body: dict):
         return JSONResponse({"detail": "未知视频质量档位"}, status_code=400)
     store = content_store()
     job = store.get_video_job(source_id)
-    if not job:
+    if not job or not (job.get("plan") or {}).get("scenes"):
         return JSONResponse(
             {"detail": "尚未生成视频分镜，请先运行 AI 文案处理"},
             status_code=400,
         )
+    if job.get("plan_model") == "premium-draft":
+        return JSONResponse({"detail": "精品编排尚未提交"}, status_code=400)
     if job["status"] == "ready":
         return JSONResponse({"detail": "成片已完成，无需重复付费制作"}, status_code=409)
     client = _ads_media_client()
@@ -584,7 +638,29 @@ async def generate_content_video(source_id: str, body: dict):
         return JSONResponse({"detail": "生成批次已变化，请重新确认费用"}, status_code=409)
     if str(body.get("quote_id") or "") != str(quote.get("quote_id") or ""):
         return JSONResponse({"detail": "视频报价已变化，请重新确认"}, status_code=409)
-    if not store.claim_video_job(source_id, quality, quote):
+    flags = premium_flags()
+    asset = store.get_asset(source_id) or {}
+    claim = store.claim_video_job(
+        source_id,
+        quality,
+        quote,
+        premium_max_inflight=(
+            flags["premium_max_inflight"]
+            if (asset.get("task_mode") or "batch") == "premium"
+            else None
+        ),
+    )
+    if claim == "limited":
+        return JSONResponse(
+            {"detail": "精品生成已达并发上限，请稍后再试"},
+            status_code=429,
+        )
+    if claim == "not_ready":
+        return JSONResponse(
+            {"detail": "精品编排尚未提交，不能开始制作"},
+            status_code=400,
+        )
+    if claim != "claimed":
         return JSONResponse({"detail": "视频正在生成，请勿重复提交"}, status_code=409)
     task = asyncio.create_task(asyncio.to_thread(_run_video_job, source_id, quality))
     _VIDEO_BACKGROUND_TASKS.add(task)
@@ -598,6 +674,265 @@ async def generate_content_video(source_id: str, body: dict):
         },
         status_code=202,
     )
+
+
+@router.post("/video/{source_id}/mode")
+async def set_content_task_mode(source_id: str, body: dict):
+    """切换批量 / 精品模式；制作中禁止切换。"""
+    blocked = _require_premium_enabled()
+    if blocked and str(body.get("task_mode") or "") == "premium":
+        return blocked
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", source_id):
+        return JSONResponse({"detail": "素材编号无效"}, status_code=400)
+    mode = str(body.get("task_mode") or "").strip()
+    if mode not in {"batch", "premium"}:
+        return JSONResponse({"detail": "未知任务模式"}, status_code=400)
+    store = content_store()
+    try:
+        job = store.get_video_job(source_id)
+        if job and job.get("status") in {
+            "queued",
+            "generating",
+            "rendering",
+            "ready",
+            "uncertain",
+        }:
+            return JSONResponse({"detail": "制作中不能切换模式"}, status_code=409)
+        store.set_task_mode(source_id, mode)
+        if mode == "batch":
+            store.set_premium_status(source_id, None)
+        log_msg = f"content premium mode source_id={source_id} mode={mode}"
+        print(log_msg)
+    except PipelineError as exc:
+        return JSONResponse({"detail": str(exc)}, status_code=400)
+    return {"source_id": source_id, "task_mode": mode}
+
+
+@router.post("/video/{source_id}/premium/start")
+async def start_premium_edit(source_id: str, body: dict):
+    """进入精品编排：可空白草稿或调用文字模型生成账本分镜。"""
+    blocked = _require_premium_enabled()
+    if blocked:
+        return blocked
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", source_id):
+        return JSONResponse({"detail": "素材编号无效"}, status_code=400)
+    store = content_store()
+    asset = store.get_asset(source_id)
+    if not asset:
+        return JSONResponse({"detail": "素材不存在"}, status_code=404)
+    store.set_task_mode(source_id, "premium")
+    blank = bool(body.get("blank"))
+    flags = premium_flags()
+    audio, ending = _coerce_audio_ending(body, flags)
+    fact_ledger: list = []
+    video_plan: dict = {}
+    model = "blank"
+    if not blank:
+        transcript_path = Path(asset.get("transcript_path") or "")
+        try:
+            transcript = transcript_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            return JSONResponse({"detail": f"无法读取口播：{exc}"}, status_code=400)
+        ads_user = os.environ.get("CREATORHUB_ADS_USER", "") or resolve_secret(
+            "CREATORHUB_ADS_USER"
+        )
+        ads_password = resolve_secret("CREATORHUB_ADS_PASSWORD")
+        caller = (
+            AdsAIJSONClient(
+                os.environ.get("CREATORHUB_ADS_URL", "https://ads.slcoolco.net"),
+                ads_user,
+                ads_password,
+            )
+            if ads_user and ads_password
+            else OpenAICompatibleJSONClient()
+        )
+        try:
+            planner = VideoPlanService(caller)
+            metadata = asset.get("metadata") or {
+                "title": asset.get("source_title") or source_id,
+                "summary": "",
+                "topic": "故障诊断",
+            }
+            video_plan, model = await asyncio.to_thread(
+                planner.create, metadata, transcript
+            )
+            fact_ledger = [
+                {
+                    "beat_id": beat.get("beat_id"),
+                    "source_quote": beat.get("source_quote"),
+                    "corrected_fact": beat.get("corrected_fact"),
+                    "tag": "操作",
+                }
+                for beat in (video_plan.get("source_beats") or [])
+            ]
+        except PipelineError as exc:
+            return JSONResponse({"detail": str(exc)}, status_code=503)
+        finally:
+            if isinstance(caller, AdsAIJSONClient):
+                caller.close()
+    saved = store.save_premium_script(
+        source_id,
+        fact_ledger=fact_ledger,
+        video_plan=video_plan,
+        audio_mode=audio,
+        ending_mode=ending,
+        draft=True,
+    )
+    store.set_premium_status(source_id, "editing")
+    return {
+        "source_id": source_id,
+        "premium_status": "editing",
+        "model": model,
+        "fact_ledger": fact_ledger,
+        "video_plan": video_plan,
+        "audio_mode": audio,
+        "ending_mode": ending,
+        "draft_version": saved["draft_version"],
+    }
+
+
+@router.post("/video/{source_id}/premium/save")
+async def save_premium_edit(source_id: str, body: dict):
+    """保存精品草稿；draft=1 不写版本快照。"""
+    blocked = _require_premium_enabled()
+    if blocked:
+        return blocked
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", source_id):
+        return JSONResponse({"detail": "素材编号无效"}, status_code=400)
+    store = content_store()
+    asset = store.get_asset(source_id)
+    if not asset or asset.get("task_mode") != "premium":
+        return JSONResponse({"detail": "不是精品任务"}, status_code=400)
+    flags = premium_flags()
+    audio, ending = _coerce_audio_ending(body, flags)
+    draft = bool(body.get("draft", True))
+    try:
+        saved = store.save_premium_script(
+            source_id,
+            fact_ledger=list(body.get("fact_ledger") or []),
+            video_plan=dict(body.get("video_plan") or body.get("plan") or {}),
+            audio_mode=audio,
+            ending_mode=ending,
+            draft=draft,
+            expected_version=body.get("expected_version"),
+        )
+        store.set_premium_status(source_id, "editing")
+    except PipelineError as exc:
+        code = 409 if "冲突" in str(exc) else 400
+        return JSONResponse({"detail": str(exc)}, status_code=code)
+    return {
+        "source_id": source_id,
+        "draft_version": saved["draft_version"],
+        "revision_id": saved.get("revision_id"),
+        "audio_mode": audio,
+        "ending_mode": ending,
+    }
+
+
+@router.post("/video/{source_id}/premium/submit")
+async def submit_premium_edit(source_id: str, body: dict):
+    """校验并写入 video_jobs.planned，不调用报价。"""
+    blocked = _require_premium_enabled()
+    if blocked:
+        return blocked
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", source_id):
+        return JSONResponse({"detail": "素材编号无效"}, status_code=400)
+    store = content_store()
+    asset = store.get_asset(source_id)
+    if not asset or asset.get("task_mode") != "premium":
+        return JSONResponse({"detail": "不是精品任务"}, status_code=400)
+    flags = premium_flags()
+    audio, ending = _coerce_audio_ending(body, flags)
+    plan = dict(body.get("plan") or body.get("video_plan") or {})
+    fact_ledger = list(body.get("fact_ledger") or [])
+    if not fact_ledger:
+        fact_ledger = [
+            {
+                "beat_id": beat.get("beat_id"),
+                "source_quote": beat.get("source_quote"),
+                "corrected_fact": beat.get("corrected_fact"),
+            }
+            for beat in (plan.get("source_beats") or [])
+        ]
+    try:
+        guarded = VideoPlanService.guard_plan(plan)
+        active = guarded.get("episode_plan", [{}])[
+            int(guarded.get("active_episode") or 1) - 1
+        ]
+        required = set(active.get("beat_ids") or [])
+        covered = set()
+        for scene in guarded.get("scenes") or []:
+            covered.update(str(item) for item in scene.get("beat_ids") or [])
+        missing = sorted(required - covered)
+        if missing:
+            raise PipelineError(f"知识点未覆盖：{', '.join(missing)}")
+    except PipelineError as exc:
+        return JSONResponse({"detail": str(exc)}, status_code=400)
+    store.save_premium_script(
+        source_id,
+        fact_ledger=fact_ledger,
+        video_plan=guarded,
+        audio_mode=audio,
+        ending_mode=ending,
+        draft=False,
+    )
+    result = store.save_video_plan(
+        source_id,
+        guarded,
+        "premium-manual",
+        estimated_cost_cny=estimate_plan_cost(guarded, "preview"),
+        premium_status="ready",
+    )
+    if result == "blocked":
+        return JSONResponse({"detail": "视频制作中，不能覆盖分镜"}, status_code=409)
+    return {
+        "source_id": source_id,
+        "status": "planned",
+        "premium_status": "ready",
+        "audio_mode": audio,
+        "ending_mode": ending,
+    }
+
+
+@router.get("/video/{source_id}/premium/revisions")
+async def list_premium_revisions(source_id: str):
+    """列出精品人工保存版本。"""
+    blocked = _require_premium_enabled()
+    if blocked:
+        return blocked
+    store = content_store()
+    return {
+        "source_id": source_id,
+        "revisions": store.list_premium_revisions(source_id),
+    }
+
+
+@router.post("/video/{source_id}/premium/revisions/{revision_id}/restore")
+async def restore_premium_revision(source_id: str, revision_id: int):
+    """恢复某一版本到草稿，并生成新修订。"""
+    blocked = _require_premium_enabled()
+    if blocked:
+        return blocked
+    store = content_store()
+    revision = store.get_premium_revision(source_id, revision_id)
+    if not revision:
+        return JSONResponse({"detail": "版本不存在"}, status_code=404)
+    saved = store.save_premium_script(
+        source_id,
+        fact_ledger=revision["fact_ledger"],
+        video_plan=revision["video_plan"],
+        audio_mode=revision["audio_mode"],
+        ending_mode=revision["ending_mode"],
+        draft=False,
+    )
+    store.set_premium_status(source_id, "editing")
+    return {
+        "source_id": source_id,
+        "draft_version": saved["draft_version"],
+        "revision_id": saved.get("revision_id"),
+        "fact_ledger": revision["fact_ledger"],
+        "video_plan": revision["video_plan"],
+    }
 
 
 @router.get("/video/{source_id}")

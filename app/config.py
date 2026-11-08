@@ -185,6 +185,24 @@ class Config:
     risk_control: RiskControlConfig = field(default_factory=RiskControlConfig)
     db_path: str = "./data/creatorhub.db"
     proxies: List[str] = field(default_factory=list)  # 代理池;建号时一号一代理 sticky 分配
+    premium_enable: bool = False
+    premium_max_inflight: int = 1
+    premium_dub_sync_enable: bool = False
+    premium_ending_enable: bool = False
+
+
+def _as_bool(value, default: bool = False) -> bool:
+    """安全解析配置布尔值。"""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return default
 
 
 def load_config(path: str | None = None) -> Config:
@@ -194,6 +212,17 @@ def load_config(path: str | None = None) -> Config:
     p = Path(path)
     if p.exists():
         raw = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+        cfg.premium_enable = _as_bool(raw.get("premium_enable"), False)
+        try:
+            cfg.premium_max_inflight = max(1, int(raw.get("premium_max_inflight", 1)))
+        except (TypeError, ValueError):
+            cfg.premium_max_inflight = 1
+        cfg.premium_dub_sync_enable = _as_bool(
+            raw.get("premium_dub_sync_enable"), False
+        )
+        cfg.premium_ending_enable = _as_bool(
+            raw.get("premium_ending_enable"), False
+        )
         s = raw.get("server", {})
         cfg.server = ServerConfig(**{k: s[k] for k in ("host", "port") if k in s})
         e = raw.get("engine", {})
