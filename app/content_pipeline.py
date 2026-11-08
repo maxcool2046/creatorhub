@@ -392,7 +392,8 @@ class ContentIndexStore:
                     metadata_confirmed INTEGER NOT NULL DEFAULT 0,
                     status TEXT NOT NULL DEFAULT 'indexed',
                     error TEXT NOT NULL DEFAULT '',
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    task_mode TEXT NOT NULL DEFAULT 'batch'
                 );
                 CREATE TABLE IF NOT EXISTS drafts (
                     source_id TEXT NOT NULL,
@@ -418,10 +419,47 @@ class ContentIndexStore:
                     generation_id TEXT NOT NULL DEFAULT '',
                     output_path TEXT NOT NULL DEFAULT '',
                     error TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL,
+                    premium_status TEXT
+                );
+                CREATE TABLE IF NOT EXISTS premium_script (
+                    source_id TEXT PRIMARY KEY,
+                    fact_ledger_json TEXT NOT NULL DEFAULT '[]',
+                    video_plan_json TEXT NOT NULL DEFAULT '{}',
+                    audio_mode TEXT NOT NULL DEFAULT 'dub_after',
+                    ending_mode TEXT NOT NULL DEFAULT 'normal',
+                    draft_version INTEGER NOT NULL DEFAULT 1,
                     updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS premium_asset (
+                    asset_id TEXT PRIMARY KEY,
+                    source_id TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    sha256 TEXT NOT NULL,
+                    scene_index INTEGER,
+                    kind TEXT NOT NULL DEFAULT 'reference',
+                    missing INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS premium_revision (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_id TEXT NOT NULL,
+                    fact_ledger_json TEXT NOT NULL,
+                    video_plan_json TEXT NOT NULL,
+                    audio_mode TEXT NOT NULL,
+                    ending_mode TEXT NOT NULL,
+                    created_at TEXT NOT NULL
                 );
                 """
             )
+            asset_columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(assets)").fetchall()
+            }
+            if "task_mode" not in asset_columns:
+                conn.execute(
+                    "ALTER TABLE assets ADD COLUMN task_mode TEXT NOT NULL DEFAULT 'batch'"
+                )
             columns = {
                 row["name"]
                 for row in conn.execute("PRAGMA table_info(video_jobs)").fetchall()
@@ -438,6 +476,10 @@ class ContentIndexStore:
                 conn.execute(
                     "ALTER TABLE video_jobs ADD COLUMN generation_id TEXT NOT NULL DEFAULT ''"
                 )
+            if "premium_status" not in columns:
+                conn.execute(
+                    "ALTER TABLE video_jobs ADD COLUMN premium_status TEXT"
+                )
             conn.execute(
                 """
                 UPDATE video_jobs SET status='failed', progress=0,
@@ -452,14 +494,14 @@ class ContentIndexStore:
         return datetime.now(timezone.utc).isoformat()
 
     def upsert_asset(self, asset: dict) -> None:
-        """按视频编号幂等更新本机文件指纹。"""
+        """按视频编号幂等更新本机文件指纹；不覆盖已有 task_mode。"""
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO assets (
                     source_id, author, source_title, source_path, transcript_path,
-                    sha256, size_bytes, mtime, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    sha256, size_bytes, mtime, updated_at, task_mode
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(source_id) DO UPDATE SET
                     author=excluded.author, source_title=excluded.source_title,
                     source_path=excluded.source_path, transcript_path=excluded.transcript_path,
@@ -476,8 +518,269 @@ class ContentIndexStore:
                     int(asset["size_bytes"]),
                     int(asset["mtime"]),
                     self._now(),
+                    str(asset.get("task_mode") or "batch"),
                 ),
             )
+
+    def set_task_mode(self, source_id: str, task_mode: str) -> None:
+        """设置素材生产模式；仅允许 batch / premium。"""
+        if task_mode not in {"batch", "premium"}:
+            raise PipelineError("未知任务模式")
+        with self._connect() as conn:
+            changed = conn.execute(
+                "UPDATE assets SET task_mode=?, updated_at=? WHERE source_id=?",
+                (task_mode, self._now(), source_id),
+            ).rowcount
+            if changed != 1:
+                raise PipelineError("本机索引不存在")
+
+    def set_premium_status(self, source_id: str, status: Optional[str]) -> None:
+        """写入精品编排状态到 video_jobs；制作中禁止改动。"""
+        if status not in {None, "editing", "ready"}:
+            raise PipelineError("未知精品状态")
+        with self._connect() as conn:
+            asset = conn.execute(
+                "SELECT source_id FROM assets WHERE source_id=?",
+                (source_id,),
+            ).fetchone()
+            if not asset:
+                raise PipelineError("本机索引不存在")
+            row = conn.execute(
+                "SELECT status FROM video_jobs WHERE source_id=?",
+                (source_id,),
+            ).fetchone()
+            if row and row["status"] in {
+                "queued",
+                "generating",
+                "rendering",
+                "ready",
+                "uncertain",
+            }:
+                raise PipelineError("视频制作中，不能改精品状态")
+            if row:
+                conn.execute(
+                    "UPDATE video_jobs SET premium_status=?, updated_at=? WHERE source_id=?",
+                    (status, self._now(), source_id),
+                )
+                return
+            # 尚无计划行：仅 editing 允许占位，避免误进报价
+            if status == "editing":
+                conn.execute(
+                    """
+                    INSERT INTO video_jobs (
+                        source_id, plan_json, plan_model, quality, status, progress,
+                        estimated_cost_cny, output_path, error, updated_at, premium_status
+                    ) VALUES (?, '{}', 'premium-draft', 'preview', 'planned', 0, 0, '', '', ?, 'editing')
+                    """,
+                    (source_id, self._now()),
+                )
+            elif status is None:
+                return
+            else:
+                raise PipelineError("请先保存精品草稿再提交")
+
+    def save_premium_script(
+        self,
+        source_id: str,
+        *,
+        fact_ledger: list,
+        video_plan: dict,
+        audio_mode: str = "dub_after",
+        ending_mode: str = "normal",
+        draft: bool = True,
+        expected_version: Optional[int] = None,
+    ) -> dict:
+        """保存精品草稿；draft=False 时额外写入版本快照。"""
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute(
+                "SELECT draft_version FROM premium_script WHERE source_id=?",
+                (source_id,),
+            ).fetchone()
+            version = int(current["draft_version"]) if current else 0
+            if expected_version is not None and version != int(expected_version):
+                raise PipelineError("草稿版本冲突，请刷新后重试")
+            next_version = version + 1
+            payload = (
+                source_id,
+                json.dumps(fact_ledger, ensure_ascii=False),
+                json.dumps(video_plan, ensure_ascii=False),
+                audio_mode,
+                ending_mode,
+                next_version,
+                self._now(),
+            )
+            conn.execute(
+                """
+                INSERT INTO premium_script (
+                    source_id, fact_ledger_json, video_plan_json, audio_mode,
+                    ending_mode, draft_version, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(source_id) DO UPDATE SET
+                    fact_ledger_json=excluded.fact_ledger_json,
+                    video_plan_json=excluded.video_plan_json,
+                    audio_mode=excluded.audio_mode,
+                    ending_mode=excluded.ending_mode,
+                    draft_version=excluded.draft_version,
+                    updated_at=excluded.updated_at
+                """,
+                payload,
+            )
+            revision_id = None
+            if not draft:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO premium_revision (
+                        source_id, fact_ledger_json, video_plan_json,
+                        audio_mode, ending_mode, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    payload[:5] + (self._now(),),
+                )
+                revision_id = int(cursor.lastrowid)
+            return {
+                "source_id": source_id,
+                "draft_version": next_version,
+                "revision_id": revision_id,
+            }
+
+    def get_premium_script(self, source_id: str) -> Optional[dict]:
+        """读取精品草稿。"""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM premium_script WHERE source_id=?",
+                (source_id,),
+            ).fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        item["fact_ledger"] = json.loads(item.pop("fact_ledger_json") or "[]")
+        item["video_plan"] = json.loads(item.pop("video_plan_json") or "{}")
+        return item
+
+    def list_premium_revisions(self, source_id: str) -> List[dict]:
+        """列出人工保存的精品版本。"""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, source_id, created_at, audio_mode, ending_mode
+                FROM premium_revision WHERE source_id=? ORDER BY id DESC
+                """,
+                (source_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_premium_revision(self, source_id: str, revision_id: int) -> Optional[dict]:
+        """读取某一精品版本全文。"""
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM premium_revision
+                WHERE source_id=? AND id=?
+                """,
+                (source_id, int(revision_id)),
+            ).fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        item["fact_ledger"] = json.loads(item.pop("fact_ledger_json") or "[]")
+        item["video_plan"] = json.loads(item.pop("video_plan_json") or "{}")
+        return item
+
+    def register_premium_asset(
+        self,
+        source_id: str,
+        *,
+        path: str,
+        sha256: str,
+        scene_index: Optional[int] = None,
+        kind: str = "reference",
+    ) -> dict:
+        """登记本地参考图；禁止视频扩展名。"""
+        suffix = Path(path).suffix.lower()
+        if suffix not in {".png", ".jpg", ".jpeg"}:
+            raise PipelineError("参考素材仅支持 png/jpg")
+        if "masters" in Path(path).as_posix().lower():
+            raise PipelineError("参考素材路径非法")
+        with self._connect() as conn:
+            existing = conn.execute(
+                "SELECT asset_id, path FROM premium_asset WHERE sha256=? AND source_id=?",
+                (sha256, source_id),
+            ).fetchone()
+            if existing:
+                return dict(existing)
+            asset_id = hashlib.sha256(f"{source_id}:{sha256}".encode("utf-8")).hexdigest()[:24]
+            conn.execute(
+                """
+                INSERT INTO premium_asset (
+                    asset_id, source_id, path, sha256, scene_index, kind, missing, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 0, ?)
+                """,
+                (
+                    asset_id,
+                    source_id,
+                    path,
+                    sha256,
+                    scene_index,
+                    kind,
+                    self._now(),
+                ),
+            )
+            return {"asset_id": asset_id, "path": path}
+
+    def list_premium_assets(self, source_id: str) -> List[dict]:
+        """列出任务本地参考图，并刷新缺失标记。"""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM premium_asset WHERE source_id=? ORDER BY updated_at DESC",
+                (source_id,),
+            ).fetchall()
+            result = []
+            for row in rows:
+                item = dict(row)
+                missing = 0 if Path(item["path"]).is_file() else 1
+                if int(item.get("missing") or 0) != missing:
+                    conn.execute(
+                        "UPDATE premium_asset SET missing=?, updated_at=? WHERE asset_id=?",
+                        (missing, self._now(), item["asset_id"]),
+                    )
+                    item["missing"] = missing
+                result.append(item)
+        return result
+
+    def count_premium_inflight(self) -> int:
+        """统计精品在制条数。"""
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS total
+                FROM assets a
+                JOIN video_jobs v ON v.source_id=a.source_id
+                WHERE a.task_mode='premium'
+                  AND v.status IN ('queued', 'generating', 'rendering')
+                """
+            ).fetchone()
+        return int(row["total"] if row else 0)
+
+    def reference_key_for_scene(self, source_id: str, scene_index: int) -> str:
+        """精品本地附件不参与网关；缺失或非 mp4 一律返回空。"""
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT path, missing FROM premium_asset
+                WHERE source_id=? AND scene_index=?
+                ORDER BY updated_at DESC LIMIT 1
+                """,
+                (source_id, int(scene_index)),
+            ).fetchone()
+        if not row:
+            return ""
+        path = Path(row["path"])
+        if int(row["missing"] or 0) == 1 or not path.is_file():
+            return ""
+        if path.suffix.lower() != ".mp4":
+            return ""
+        return ""
 
     def save_metadata(self, source_id: str, metadata: dict, model: str, *, confirmed: bool) -> None:
         """保存 AI 建议；已人工确认的值不会被 AI 静默覆盖。"""
@@ -542,11 +845,12 @@ class ContentIndexStore:
         model: str,
         *,
         estimated_cost_cny: float,
-    ) -> None:
-        """保存安全二创计划；已生成的成片不会被自动重置。"""
+        premium_status: Optional[str] = None,
+    ) -> str:
+        """保存安全二创计划；制作中返回 blocked，成功返回 saved。"""
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT status FROM video_jobs WHERE source_id=?",
+                "SELECT status, premium_status FROM video_jobs WHERE source_id=?",
                 (source_id,),
             ).fetchone()
             if row and row["status"] in {
@@ -556,17 +860,23 @@ class ContentIndexStore:
                 "ready",
                 "uncertain",
             }:
-                return
+                return "blocked"
+            next_premium = (
+                premium_status
+                if premium_status is not None
+                else (row["premium_status"] if row else None)
+            )
             conn.execute(
                 """
                 INSERT INTO video_jobs (
                     source_id, plan_json, plan_model, quality, status, progress,
-                    estimated_cost_cny, output_path, error, updated_at
-                ) VALUES (?, ?, ?, 'preview', 'planned', 0, ?, '', '', ?)
+                    estimated_cost_cny, output_path, error, updated_at, premium_status
+                ) VALUES (?, ?, ?, 'preview', 'planned', 0, ?, '', '', ?, ?)
                 ON CONFLICT(source_id) DO UPDATE SET
                     plan_json=excluded.plan_json, plan_model=excluded.plan_model,
                     estimated_cost_cny=excluded.estimated_cost_cny,
-                    status='planned', progress=0, error='', updated_at=excluded.updated_at
+                    status='planned', progress=0, error='', updated_at=excluded.updated_at,
+                    premium_status=excluded.premium_status
                 """,
                 (
                     source_id,
@@ -574,19 +884,48 @@ class ContentIndexStore:
                     model,
                     float(estimated_cost_cny),
                     self._now(),
+                    next_premium,
                 ),
             )
+            return "saved"
 
-    def claim_video_job(self, source_id: str, quality: str, quote: dict) -> bool:
-        """原子领取一条付费任务，防止并发点击重复提交。"""
+    def claim_video_job(
+        self,
+        source_id: str,
+        quality: str,
+        quote: dict,
+        *,
+        premium_max_inflight: Optional[int] = None,
+    ) -> str:
+        """原子领取付费任务；精品可在同事务内检查在制上限。"""
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            asset = conn.execute(
+                "SELECT task_mode FROM assets WHERE source_id=?",
+                (source_id,),
+            ).fetchone()
             current = conn.execute(
-                "SELECT status FROM video_jobs WHERE source_id=?",
+                "SELECT status, premium_status FROM video_jobs WHERE source_id=?",
                 (source_id,),
             ).fetchone()
             if not current or current["status"] not in {"planned", "failed"}:
-                return False
+                return "busy"
+            task_mode = (asset["task_mode"] if asset else "batch") or "batch"
+            if task_mode == "premium" and current["premium_status"] != "ready":
+                return "not_ready"
+            if task_mode == "premium" and premium_max_inflight is not None:
+                limit = max(1, int(premium_max_inflight))
+                inflight = conn.execute(
+                    """
+                    SELECT COUNT(*) AS total
+                    FROM assets a
+                    JOIN video_jobs v ON v.source_id=a.source_id
+                    WHERE a.task_mode='premium'
+                      AND v.status IN ('queued', 'generating', 'rendering')
+                    """
+                ).fetchone()
+                if int(inflight["total"] or 0) >= limit:
+                    return "limited"
             changed = conn.execute(
                 """
                 UPDATE video_jobs SET status='queued', progress=0, quality=?,
@@ -604,7 +943,7 @@ class ContentIndexStore:
                     source_id,
                 ),
             ).rowcount
-        return changed == 1
+        return "claimed" if changed == 1 else "busy"
 
     def list_incomplete_video_jobs(self) -> List[dict]:
         """列出重启后需要安全续跑的本机视频任务。"""
@@ -721,7 +1060,22 @@ class ContentIndexStore:
             item = dict(row)
             item["metadata"] = json.loads(item.pop("metadata_json")) if item.get("metadata_json") else None
             raw_plan = item.pop("video_plan_json", None)
-            item["video_plan"] = json.loads(raw_plan) if raw_plan else None
+            plan = json.loads(raw_plan) if raw_plan else None
+            # 精品占位草稿计划为空对象，列表不暴露以免误显示报价按钮
+            if (
+                plan == {}
+                and item.get("premium_status") == "editing"
+                and (item.get("task_mode") or "batch") == "premium"
+            ):
+                plan = None
+                item["video_status"] = None
+            item["video_plan"] = plan
+            script = self.get_premium_script(item["source_id"])
+            item["premium_script"] = script
+            item["premium_assets"] = self.list_premium_assets(item["source_id"])
+            item["premium_revisions"] = self.list_premium_revisions(item["source_id"])
+            if not item.get("premium_status") and script and item.get("task_mode") == "premium":
+                item["premium_status"] = "editing"
             result.append(item)
         return result
 
@@ -847,8 +1201,16 @@ class ContentPipeline:
                 existing = self.store.get_asset(item.source_id) or {}
                 draft_count = len(self.store.list_drafts(item.source_id))
                 video_job = self.store.get_video_job(item.source_id)
+                task_mode = str(existing.get("task_mode") or "batch")
+                allow_auto_plan = task_mode != "premium"
+                # 精品占位 job（空 plan）视为尚无自动分镜
+                has_real_plan = bool(
+                    video_job
+                    and (video_job.get("plan") not in (None, {}))
+                    and video_job.get("plan_model") != "premium-draft"
+                )
                 if existing.get("metadata") and draft_count == len(PLATFORMS):
-                    if self.video_planner and not video_job:
+                    if self.video_planner and allow_auto_plan and not has_real_plan:
                         from .content_video_pipeline import estimate_plan_cost
 
                         plan, plan_model = self.video_planner.create(
@@ -869,7 +1231,7 @@ class ContentPipeline:
                 drafts, draft_model = self.service.make_drafts(metadata, item.transcript)
                 self.store.save_metadata(item.source_id, metadata, metadata_model, confirmed=False)
                 self.store.save_drafts(item.source_id, drafts, draft_model)
-                if self.video_planner:
+                if self.video_planner and allow_auto_plan:
                     from .content_video_pipeline import estimate_plan_cost
 
                     plan, plan_model = self.video_planner.create(metadata, item.transcript)

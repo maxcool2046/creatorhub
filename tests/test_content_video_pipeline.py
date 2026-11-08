@@ -544,13 +544,13 @@ def test_video_job_claim_is_atomic_and_active_plan_is_immutable(tmp_path):
     database = tmp_path / "content.sqlite"
     store = ContentIndexStore(database)
     store.save_video_plan("asset-1", _plan(), "deepseek", estimated_cost_cny=3.0)
-    assert store.claim_video_job("asset-1", "preview", _quote()) is True
+    assert store.claim_video_job("asset-1", "preview", _quote()) == "claimed"
     assert store.get_video_job("asset-1")["generation_id"] == _quote()["generation_id"]
     assert ContentIndexStore(database).claim_video_job(
         "asset-1",
         "preview",
         _quote(),
-    ) is False
+    ) == "busy"
     changed = _plan()
     changed["title"] = "不应覆盖"
     store.save_video_plan("asset-1", changed, "deepseek", estimated_cost_cny=3.0)
@@ -607,10 +607,13 @@ def test_generate_video_revalidates_exact_generation_quote(monkeypatch):
 
     class FakeStore:
         def get_video_job(self, source_id):
-            return {"status": "planned"}
+            return {"status": "planned", "plan": _plan(), "plan_model": "deepseek"}
 
-        def claim_video_job(self, source_id, quality, current_quote):
-            return current_quote == quote
+        def get_asset(self, source_id):
+            return {"task_mode": "batch"}
+
+        def claim_video_job(self, source_id, quality, current_quote, **kwargs):
+            return "claimed" if current_quote == quote else "busy"
 
     class FakeGateway:
         def __init__(self):
@@ -649,9 +652,12 @@ def test_generate_video_rejects_changed_generation_before_claim(monkeypatch):
 
     class FakeStore:
         def get_video_job(self, source_id):
-            return {"status": "planned"}
+            return {"status": "planned", "plan": _plan(), "plan_model": "deepseek"}
 
-        def claim_video_job(self, *args):
+        def get_asset(self, source_id):
+            return {"task_mode": "batch"}
+
+        def claim_video_job(self, *args, **kwargs):
             raise AssertionError("批次不一致时不得认领付费任务")
 
     class FakeGateway:
@@ -924,7 +930,7 @@ def test_paid_polling_timeout_stops_without_new_generation(tmp_path, monkeypatch
         "asset-1",
         "preview",
         _quote(),
-    ) is False
+    ) == "busy"
 
 
 def test_startup_recovery_retries_database_and_resumes_job(monkeypatch):

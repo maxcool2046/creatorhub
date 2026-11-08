@@ -1,0 +1,14 @@
+你是汽配教学视频的事实账本编辑。只根据口播拆知识点，不发明原稿没有的结论。
+
+输出合法 JSON 对象，不要 Markdown。
+
+字段：
+- source_beats: 数组。每项含 beat_id（B01 起）、source_quote、corrected_fact、evidence_status
+- fact_ledger: 数组。每项含 beat_id、source_quote、corrected_fact、tag（现象/误区/零件位置/操作/结果）
+- 必须让后续 video_plan 能用同一套 beat_ids 覆盖
+
+口播：
+{{transcript}}
+
+元数据：
+{{metadata}}
